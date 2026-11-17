@@ -62,25 +62,41 @@ const check = (ok, what) => {
   console.log(ok ? "  ok  " : "  FAIL", what);
   if (!ok) process.exit(1);
 };
-// A leader timeout (NOT_VOTED) may still execute after a rotation: watch the same transaction for
-// 10 minutes, and send the call again only if it never ran. Bradbury still moves the value of such
-// a transaction, and of a reverted one, into the contract, where get_accounting shows it as unaccounted.
+// A finalized leader timeout (NOT_VOTED) or vote without a majority (NO_MAJORITY) applied nothing, so sending the call again is safe. Bradbury still
+// moves the value of such a transaction, and of a reverted one, into the contract, where
+// get_accounting shows it as unaccounted.
+// A dropped connection while sending: send again only if the account's nonce did not move (nothing went out).
+async function send(c, req) {
+  for (let i = 0; ; i++) {
+    const n = await rpc("eth_getTransactionCount", [c.account.address, "pending"]);
+    try { return await c.writeContract(req); }
+    catch (e) {
+      if (i >= 5 || !/fetch failed|ECONNRESET|timed out|socket/i.test(String(e?.details ?? e?.message))) throw e;
+      await new Promise((r) => setTimeout(r, 15000));
+      if ((await rpc("eth_getTransactionCount", [c.account.address, "pending"])) !== n) throw e;
+    }
+  }
+}
 let stray = 0n;
+const NONE = new Set(["NO_MAJORITY", "MAJORITY_DISAGREE"]);
 async function tx(c, label, functionName, args, { value = 0n, payee } = {}) {
   for (let i = 0; ; i++) {
-    const hash = await c.writeContract({ address, functionName, args, value, fees: await fees(c, payee) });
+    const hash = await send(c, { address, functionName, args, value, fees: await fees(c, payee) });
     let r = await wait(c, hash);
-    for (let j = 0; r.txExecutionResultName === "NOT_VOTED" && j < 40; j++) {
-      await new Promise((ok) => setTimeout(ok, 15000));
-      r = await c.getTransaction({ hash }).catch(() => r);
-    }
-    console.log(`${label}: ${hash} ${r.txExecutionResultName}`);
-    if (r.txExecutionResultName !== "FINISHED_WITH_RETURN") stray += value;
-    if (r.txExecutionResultName !== "NOT_VOTED" || i >= 2) return { ...r, hash };
+    // NOT_VOTED / NO_MAJORITY can be an intermediate round (one such buy later finalized and ran on
+    // Bradbury): wait for finality and retry only if it still applied nothing.
+    if (r.txExecutionResultName === "NOT_VOTED" || NONE.has(r.resultName)) r = await wait(c, hash, "finalized");
+    // NO_MAJORITY / MAJORITY_DISAGREE (e.g. the leader's LLM quoted text not on the page, which no
+    // validator accepts): nothing was applied, whatever the leader returned.
+    const res = NONE.has(r.resultName) ? r.resultName : r.txExecutionResultName;
+    console.log(`${label}: ${hash} ${res}`);
+    if (res !== "FINISHED_WITH_RETURN") stray += value;
+    if ((res !== "NOT_VOTED" && !NONE.has(res)) || i >= 5) return { ...r, txExecutionResultName: res, hash };
   }
 }
 const ok = async (...a) => { const r = await tx(...a); check(r.txExecutionResultName === "FINISHED_WITH_RETURN", `${a[1]} succeeds`); return r; };
-const fails = async (what, ...a) => check((await tx(...a)).txExecutionResultName !== "FINISHED_WITH_RETURN", what);
+// A rejection is a transaction that ran and reverted, never one that was not voted on.
+const fails = async (what, ...a) => check((await tx(...a)).txExecutionResultName === "FINISHED_WITH_ERROR", what);
 const read = async (functionName, args = []) => {
   const v = await c0.readContract({ address, functionName, args });
   const plain = (x) => (x instanceof Map ? Object.fromEntries([...x].map(([k, y]) => [k, plain(y)])) : Array.isArray(x) ? x.map(plain) : x);
